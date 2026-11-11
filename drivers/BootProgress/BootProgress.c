@@ -446,6 +446,7 @@ void boot_progress_putc(char c)
 void boot_progress_stage(const char *s)
 {
     ramoops_log_line(RAMOOPS_KIND_STAGE, s);
+
     uint64_t flags = irq_save();
     if (flags == UINT64_MAX) return;
     if (!busy && !panic_state) {
@@ -1304,6 +1305,9 @@ void boot_progress_process_stage(int pid, const char *name, const char *stage)
 {
     char line[STAGE_BYTES];
     snprintf(line, sizeof(line), "pid=%d %.20s %.36s", pid, name ? name : "?", stage ? stage : "?");
+    // The on-medium snapshots read the kernel message buffer; a process record kept only in the RAM
+    // ring is lost at power-off. Printed here, at the entry point the console never re-enters.
+    printf("bp: %s\n", line);
     boot_progress_stage(line);
 }
 void boot_progress_exit(int pid, const char *name, int status, unsigned ns, uint64_t code)
@@ -1315,6 +1319,7 @@ void boot_progress_exit(int pid, const char *name, int status, unsigned ns, uint
     if (flags == UINT64_MAX) return;
     if (!panic_state && !busy) copy_line(exit_stage, sizeof(exit_stage), line);
     irq_restore(flags);
+    printf("bp: %s\n", line);
     boot_progress_stage(line);
 }
 

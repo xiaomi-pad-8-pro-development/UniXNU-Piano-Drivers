@@ -437,7 +437,8 @@ IOReturn NativeAdrenoVm::mapLocked(NativeAdrenoMemory *memory,unsigned upper,uin
     if(!memory)return kIOReturnBadArgument;
     const unsigned cls=aliasClass(permissions,writeback,shareability)&15;
     const bool exclusive=exclusivePages(memory,cls);
-    IOReturn checked=preflight(memory,upper,iova,permissions,writeback,shareability,exclusive);if(checked)return checked;
+    IOReturn checked=preflight(memory,upper,iova,permissions,writeback,shareability,exclusive);
+    if(checked)return checked;
     if(next_handle_==UINT64_MAX)return kIOReturnNoResources;
     clock.lap(0,5);
     checked=memory->holdForDevice();if(checked)return checked;

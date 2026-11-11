@@ -23,14 +23,14 @@ public:
         if(!slots || slots>Slots || (slots&(slots-1)))return false;
         if(cells_ && size_!=slots*2)release();
         if(!cells_) {
-            cells_=IONewData(Cell,slots*2);
+            cells_=(Cell*)IOMalloc(sizeof(Cell)*(slots*2));   /* no IONewData in a template: its typed-allocation macro trips clang's parser here */
             if(!cells_)return false;
             size_=slots*2;mask_=size_-1;
         }
         memset(cells_,0,sizeof(Cell)*size_);
         return true;
     }
-    void release() {if(cells_)IODeleteData(cells_,Cell,size_);cells_=nullptr;size_=mask_=0;}
+    void release() {if(cells_)IOFree(cells_,sizeof(Cell)*size_);cells_=nullptr;size_=mask_=0;}
     /* The slots of the last allocate() (0 while released). */
     size_t capacity() const {return size_/2;}
     /* UINT32_MAX: not present. */
@@ -85,8 +85,8 @@ template<size_t Slots,size_t Quarantine=4096> class NativeAdrenoHandleSlots {
 public:
     bool allocate()
     {
-        if(!queue_)queue_=IONewData(Free,Slots);
-        if(!generation_)generation_=IONewData(uint32_t,Slots);
+        if(!queue_)queue_=(Free*)IOMalloc(sizeof(Free)*Slots);
+        if(!generation_)generation_=(uint32_t*)IOMalloc(sizeof(uint32_t)*Slots);
         if(!queue_ || !generation_) {release();return false;}
         for(size_t i=0;i<Slots;++i) {queue_[i]={uint32_t(i),0};generation_[i]=0;}
         head_=0;count_=Slots;allocations_=Quarantine;   /* never-used slots are past any quarantine */
@@ -94,8 +94,8 @@ public:
     }
     void release()
     {
-        if(queue_)IODeleteData(queue_,Free,Slots);
-        if(generation_)IODeleteData(generation_,uint32_t,Slots);
+        if(queue_)IOFree(queue_,sizeof(Free)*Slots);
+        if(generation_)IOFree(generation_,sizeof(uint32_t)*Slots);
         queue_=nullptr;generation_=nullptr;head_=count_=0;
     }
     /* The oldest free slot past its quarantine, or UINT32_MAX (none free, or the oldest freed too recently). */

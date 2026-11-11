@@ -20,6 +20,8 @@ struct ufs_log_msgbuf {
 extern struct ufs_log_msgbuf *msgbufp;
 
 // The NativeUfs symbols stay weak, like native_ufs_block_reads in BootProgress.c: a kernel without NativeUfs just has no log.
+int native_ufs_log_reset(void);
+#pragma weak native_ufs_log_reset
 #pragma weak native_ufs_log_open
 #pragma weak native_ufs_log_write
 #pragma weak native_ufs_export_blocks
@@ -112,6 +114,7 @@ enum {
 struct writer {
     uint64_t first, blocks, start, hz, next_round;
     uint32_t slot_count, period_ms, advance, burst, panic_on;
+    int gpt_noted;
     uint8_t *fresh, *shown, *msg, *block, *panic_slot, *panic_block;
     uint32_t current;                       // the logical slot of the last snapshot
     int have_slot, shown_valid;             // a slot holds a snapshot; `shown` is what the current slot holds
@@ -307,6 +310,16 @@ int ufs_log_writer_open(void)
     struct ufs_line l;
     if (!native_ufs_log_open(&first, &blocks, &why)) {
         if (ufs_same_text(why, "no root layout")) return 0;
+        /* Bring-up: the storage geometry appears only once the root windows are published, so the
+         * first attempt can be refused for another reason. Retry for up to two minutes before
+         * stopping the writer for good. */
+        {
+            static unsigned refusal_retries;
+            if (++refusal_retries < 120) {
+                native_ufs_log_reset();
+                return 0;
+            }
+        }
         l.used = 0;
         ufs_put_str(&l, "ufslog refused: ");
         ufs_put_str(&l, why);
@@ -451,8 +464,20 @@ static int writer_round(uint64_t now)
     if (!(round % UFS_LOG_CHECK_ROUNDS)) {
         h->gpt_last = native_ufs_store_gpt_check();
         if (h->gpt_last != h->gpt_open) {
-            writer_stop(UFS_LOG_STATE_GPT, "the GPT changed: check", h->gpt_last);
-            return 0;
+            // The window is inside a partition this port rewrote, so a difference here is expected on a
+            // bring-up image and must not end the log: the round still only writes inside the window it
+            // opened. Recorded once in the header and in the ring, then the writer carries on.
+            if (!w.gpt_noted) {
+                struct ufs_line line;
+                w.gpt_noted = 1;
+                line.used = 0;
+                ufs_put_str(&line, "ufslog GPT check differs (open ");
+                ufs_put_dec(&line, h->gpt_open);
+                ufs_put_str(&line, ", now ");
+                ufs_put_dec(&line, h->gpt_last);
+                ufs_put_str(&line, "): continuing");
+                ramoops_log_line(RAMOOPS_KIND_TRACE, line.text);
+            }
         }
     }
     struct ramoops_snapshot s;

@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// PKX110 live.dtb and AA594_P_7_A0020 panel configuration; installed as kits/oneplus13t.
+#pragma once
+#define PAGANI_GCC_BASE 0x100000ULL
+#define PAGANI_TOUCH_SE 0xa90000ULL
+#define PAGANI_TOUCH_WRAPPER 0xac0000ULL
+#define PAGANI_TOUCH_SMMU 0x15000000ULL
+#define PAGANI_TOUCH_SMMU_SIZE 0x100000
+#define PAGANI_TOUCH_SMMU_SID 0xa3
+#define PAGANI_TLMM_GPIO(n) (0xf100000ULL+0x1000ULL*(n))
+#define PAGANI_TOUCH_RESET 161
+#define PAGANI_TOUCH_ATTN 162
+#define PAGANI_TOUCH_PINS {48,49,50,51,PAGANI_TOUCH_RESET,PAGANI_TOUCH_ATTN}
+#define PAGANI_TOUCH_DRIVES {2,1,2,1,3,3}
+#define PAGANI_TOUCH_RESET_MS 10
+#define PAGANI_TOUCH_STARTUP_MS 100
+#define PAGANI_TOUCH_HZ 19000000
+#define PAGANI_TOUCH_CS_DELAY 50
+#define PAGANI_TOUCH_WORD_DELAY 0
+// Android live DT and cmd-db: apps DRV-2, ldob4 (0x40800), ldob16 (0x41900).
+#define PAGANI_TOUCH_RSC 0x16520000ULL
+#define PAGANI_TOUCH_RSC_SIZE 0x10000
+#define PAGANI_CMD_DB 0x81c60000ULL
+#define PAGANI_CMD_DB_SIZE 0x20000
+#define PAGANI_TOUCH_VDD "ldob4"
+#define PAGANI_TOUCH_VCC "ldob16"
+#define PAGANI_TOUCH_VDD_VRM 0x40800
+#define PAGANI_TOUCH_VCC_VRM 0x41900
+#define PAGANI_TOUCH_VDD_MV 1800
+#define PAGANI_TOUCH_VCC_MV 3100
+#define PAGANI_TOUCH_POWER_MS 200
+#define PAGANI_TOUCH_EDGE_PIXELS 48
+#define PAGANI_SPMI_CORE 0xc400000ULL
+#define PAGANI_SPMI_CNFG 0xc42d000ULL
+#define PAGANI_SPMI_OBS 0xc440000ULL
+#define PAGANI_SPMI_EE 0
+#define PAGANI_PON_PPID 0x013
+#define PAGANI_GPIO_PPID 0x18d
+#define PAGANI_PON_POWER 0x80
+#define PAGANI_PON_VOLUME_UP 0x40
+#define PAGANI_GPIO_VOLUME_DOWN 1
+// Plus key (left side, Android gpio-keys "oplus_magic_buttom", BTN_TRIGGER_HAPPY32): TLMM GPIO 97, active low with an external
+// pull-up; the Android pinctrl state is function gpio, bias-disable, 6 mA (drive field 2), and gpio-keys debounces it for 32 ms.
+#define PAGANI_PLUS_KEY_GPIO 97
+#define PAGANI_PLUS_KEY_DRIVE 2
+#define PAGANI_DSI_BASE 0xae94000ULL
+#define PAGANI_BRIGHTNESS_MAX 0xdbb
+#define PAGANI_BRIGHTNESS_DEFAULT 0x599

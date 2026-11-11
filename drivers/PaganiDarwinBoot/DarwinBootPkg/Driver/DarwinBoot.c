@@ -44,6 +44,86 @@ VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, 
 #define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
 
 STATIC UINT32 U32 (CONST VOID *P) { return ReadUnaligned32 ((CONST UINT32 *)P); }
+// Bring-up diagnostics: which check refused the boot.
+//
+// Mu-Silicium "Display_Reserved" (pianoPkg/Library/MemoryMapLib/MemoryMapLib.c) and the
+// panel geometry of piano.dsc (PcdFrameBufferWidth/Height/ColorDepth). The display
+// controller scans this buffer out, so it is the framebuffer XNU should draw into.
+//
+#define PANEL_FRAMEBUFFER_BASE           0xFC800000ULL
+#define PANEL_FRAMEBUFFER_WIDTH          3200
+#define PANEL_FRAMEBUFFER_HEIGHT         2136
+#define PANEL_FRAMEBUFFER_BYTES_PER_PIXEL 4
+
+STATIC CONST CHAR16 *mBootStage = L"start";
+
+
+//
+// Bring-up diagnostics: the loader's checks land in \EFI\UniXNU\dblog.txt on the
+// volume it booted from, so a refusal can be read back over adb instead of the console.
+//
+STATIC EFI_FILE_PROTOCOL *mLog;
+
+STATIC
+VOID
+LogPrint (
+  CONST CHAR16  *Format,
+  ...
+  )
+{
+  VA_LIST  Args;
+  CHAR16   Buffer[256];
+  UINTN    Size;
+
+  if (mLog == NULL) {
+    return;
+  }
+
+  VA_START (Args, Format);
+  UnicodeVSPrint (Buffer, sizeof (Buffer), Format, Args);
+  VA_END (Args);
+  Size = StrSize (Buffer) - sizeof (CHAR16);
+  mLog->Write (mLog, &Size, Buffer);
+  mLog->Flush (mLog);
+}
+
+STATIC
+VOID
+LogOpen (
+  EFI_FILE_PROTOCOL  *Root
+  )
+{
+  EFI_STATUS  Status;
+
+  mLog   = NULL;
+  Status = Root->Open (
+                   Root,
+                   &mLog,
+                   L"\\EFI\\UniXNU\\dblog.txt",
+                   EFI_FILE_MODE_CREATE | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_READ,
+                   0
+                   );
+  if (EFI_ERROR (Status)) {
+    mLog = NULL;
+    return;
+  }
+
+  mLog->SetPosition (mLog, 0xFFFFFFFFFFFFFFFFULL);
+  LogPrint (L"--- DarwinBoot run, revision %u ---\n", (UINT64)UNIXNU_LOADER_REVISION);
+}
+
+STATIC
+VOID
+LogClose (
+  VOID
+  )
+{
+  if (mLog != NULL) {
+    mLog->Close (mLog);
+    mLog = NULL;
+  }
+}
+
 STATIC UINT64 U64 (CONST VOID *P) { return ReadUnaligned64 ((CONST UINT64 *)P); }
 
 STATIC
@@ -51,15 +131,99 @@ EFI_STATUS
 ReadBootVideo (UINT64 Video[6])
 {
   EFI_GRAPHICS_OUTPUT_PROTOCOL           *Gop;
-  EFI_STATUS                            Status;
+  EFI_HANDLE                             *Handles;
+  UINTN                                  Count;
+  UINTN                                  Index;
+  EFI_STATUS                             Status;
+  UINT64                                 Candidate[6];
 
   ZeroMem (Video, 6 * sizeof (*Video));
+  //
+  // More than one GOP instance can exist. The panel driver publishes the linear
+  // framebuffer; a scaling driver layered on top publishes a Blt-only mode with no
+  // framebuffer at all (this device: 1600x1068 PixelBltOnly, FrameBufferBase 0).
+  // XNU needs a linear framebuffer, so take the first instance that passes the
+  // video checks and fall back to the console instance only when none does.
+  //
+  Handles = NULL;
+  Count   = 0;
+  Status  = gBS->LocateHandleBuffer (ByProtocol, &gEfiGraphicsOutputProtocolGuid, NULL, &Count, &Handles);
+  if (!EFI_ERROR (Status)) {
+    Print (L"DARWINBOOT: gop instances=%lu\n", (UINT64)Count);
+    LogPrint (L"gop instances=%lu\n", (UINT64)Count);
+
+    for (Index = 0; Index < Count; Index++) {
+      if (EFI_ERROR (gBS->HandleProtocol (Handles[Index], &gEfiGraphicsOutputProtocolGuid, (VOID **)&Gop))) {
+        continue;
+      }
+
+      Print (L"DARWINBOOT: gop %lu fmt=%u fb=0x%lx %lux%lu\n", (UINT64)Index,
+             Gop->Mode == NULL || Gop->Mode->Info == NULL ? 0xff : Gop->Mode->Info->PixelFormat,
+             Gop->Mode == NULL ? 0 : Gop->Mode->FrameBufferBase,
+             Gop->Mode == NULL || Gop->Mode->Info == NULL ? 0 : Gop->Mode->Info->HorizontalResolution,
+             Gop->Mode == NULL || Gop->Mode->Info == NULL ? 0 : Gop->Mode->Info->VerticalResolution);
+      LogPrint (L"gop %lu fmt=%u fb=0x%lx size=0x%lx %lux%lu ppsl=%lu\n", (UINT64)Index,
+                Gop->Mode == NULL || Gop->Mode->Info == NULL ? 0xff : Gop->Mode->Info->PixelFormat,
+                Gop->Mode == NULL ? 0 : Gop->Mode->FrameBufferBase,
+                Gop->Mode == NULL ? 0 : Gop->Mode->FrameBufferSize,
+                Gop->Mode == NULL || Gop->Mode->Info == NULL ? 0 : Gop->Mode->Info->HorizontalResolution,
+                Gop->Mode == NULL || Gop->Mode->Info == NULL ? 0 : Gop->Mode->Info->VerticalResolution,
+                Gop->Mode == NULL || Gop->Mode->Info == NULL ? 0 : Gop->Mode->Info->PixelsPerScanLine);
+      if (EFI_ERROR (DarwinBootVideoFromGop (Gop, Candidate))) {
+        continue;
+      }
+
+      CopyMem (Video, Candidate, sizeof (Candidate));
+      FreePool (Handles);
+      return EFI_SUCCESS;
+    }
+
+    FreePool (Handles);
+  }
+
   Status = gBS->HandleProtocol (gST->ConsoleOutHandle, &gEfiGraphicsOutputProtocolGuid, (VOID **)&Gop);
   if (EFI_ERROR (Status)) {
     Status = gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&Gop);
   }
-  if (Status == EFI_NOT_FOUND) { return EFI_SUCCESS; }
-  if (EFI_ERROR (Status)) { return Status; }
+
+  if (Status == EFI_NOT_FOUND) {
+    return EFI_SUCCESS;
+  }
+
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  //
+  // Neither instance was linear. This firmware drives the panel through Blt only
+  // (two PixelBltOnly instances, FrameBufferBase 0), so hand XNU a framebuffer we
+  // own at the panel geometry: the native display driver presents it over the DPU.
+  //
+  Status = gBS->HandleProtocol (gST->ConsoleOutHandle, &gEfiGraphicsOutputProtocolGuid, (VOID **)&Gop);
+  if (EFI_ERROR (Status)) {
+    Status = gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&Gop);
+  }
+
+  if (!EFI_ERROR (Status) && (Gop->Mode != NULL) && (Gop->Mode->Info != NULL) &&
+      (Gop->Mode->Info->HorizontalResolution != 0) && (Gop->Mode->Info->VerticalResolution != 0))
+  {
+    //
+    // The panel framebuffer itself: Mu-Silicium's memory map keeps it in the
+    // "Display_Reserved" region (pianoPkg/Library/MemoryMapLib), and the display
+    // controller is already scanning it out, so writes here reach the screen with
+    // no further programming. Geometry from PcdFrameBufferWidth/Height/ColorDepth.
+    //
+    Video[0] = PANEL_FRAMEBUFFER_BASE;
+    Video[1] = 1;
+    Video[2] = (UINT64)PANEL_FRAMEBUFFER_WIDTH * PANEL_FRAMEBUFFER_BYTES_PER_PIXEL;
+    Video[3] = PANEL_FRAMEBUFFER_WIDTH;
+    Video[4] = PANEL_FRAMEBUFFER_HEIGHT;
+    Video[5] = 32;
+    LogPrint (L"panel framebuffer pa=0x%lx %lux%lu row=%lu (display reserved region)\n",
+              Video[0], Video[3], Video[4], Video[2]);
+    return EFI_SUCCESS;
+  }
+
   return DarwinBootVideoFromGop (Gop, Video);
 }
 
@@ -532,8 +696,12 @@ Boot (
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
+  LogOpen (Root);
+  LogPrint (L"stage volume open\n");
+  mBootStage = L"kernel read"; LogPrint (L"stage %s\n", mBootStage);
   Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
   if (EFI_ERROR (Status)) { goto Fail; }
+  mBootStage = L"kernel parse"; LogPrint (L"stage %s\n", mBootStage);
   Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
   Length = StrSize (Request->KernelPath);
@@ -541,6 +709,7 @@ Boot (
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".adt");
+  mBootStage = L"adt read"; LogPrint (L"stage %s\n", mBootStage);
   Status = ReadFile (Root, TreePath, SIZE_16MB, &Tree, &TreeSize);
   if (EFI_ERROR (Status)) { goto Fail; }
   Offset = 0;
@@ -549,6 +718,7 @@ Boot (
   TrustCacheOffset = MAX_UINTN;
   WindowSize = 0;
   KeepPacked = FALSE;
+  mBootStage = L"adt nodes"; LogPrint (L"stage %s\n", mBootStage);
   if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &WindowSize, &KeepPacked, DramOffsets) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if ((DramOffsets[0] == MAX_UINTN) != (DramOffsets[1] == MAX_UINTN)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if ((DramOffsets[0] != MAX_UINTN) && ((U64 ((UINT8 *)Tree + DramOffsets[0]) == 0) != (U64 ((UINT8 *)Tree + DramOffsets[1]) == 0))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
@@ -576,8 +746,12 @@ Boot (
     Status = EFI_COMPROMISED_DATA;
     goto Fail;
   }
+  mBootStage = L"video"; LogPrint (L"stage %s\n", mBootStage);
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
+  LogPrint (L"chosen video fb=0x%lx %lux%lu row=%lu depth=%lu\n",
+            Video[0], Video[3], Video[4], Video[2], Video[5]);
+  mBootStage = L"window"; LogPrint (L"stage %s\n", mBootStage);
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
   if (EFI_ERROR (Status)) { goto Fail; }
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
@@ -633,6 +807,10 @@ Boot (
   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
   Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
+  LogPrint (L"hand-off va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx window=0x%lx\n",
+            Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
+  LogPrint (L"OK\n");
+  LogClose ();
 
   //
   // The same facts in large type over the whole screen. The firmware's log
@@ -679,7 +857,9 @@ Fail:
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
-  Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
+  LogPrint (L"REFUSED %r at %s\n", Status, mBootStage);
+  LogClose ();
+  Print (L"DARWINBOOT: boot refused: %r at %s; firmware retained\n", Status, mBootStage);
   return Status;
 }
 

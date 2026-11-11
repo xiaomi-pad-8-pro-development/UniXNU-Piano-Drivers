@@ -143,12 +143,22 @@ IOReturn A830Smmu::survey(A830SmmuSurvey *out)
         if(n<A830SmmuMaxSmrs) {s.smr[n]=smr;s.s2cr[n]=s2cr;}
         if(!(smr&kSmrValid))continue;
         used[n]=true;
+        /* piano: the bootloader leaves the GPU SMMU routed for the boot splash (XBL/ABL program the same streams this
+         * driver wants), so an existing valid entry for our SIDs is the normal state here, not a conflict to refuse.
+         * The driver owns this SMMU from S3 on and resets CB0/CB2 next, so the entry is taken down instead. */
+        bool ours=false;
         for(uint16_t sid:sids)
-            if(A830_SMMU_SMR_COVERS(smr,sid))
-                return fail(A830SmmuStepSlots,A830ReasonSmmuRoute,A830_SMMU_GR0_SMR(n),smr,sid,kIOReturnBusy);
+            if(A830_SMMU_SMR_COVERS(smr,sid))ours=true;
         if(A830_SMMU_S2CR_TYPE(s2cr)==A830_SMMU_S2CR_TYPE_TRANS &&
-            (A830_SMMU_S2CR_CBNDX(s2cr)==config_.cb_gpu || A830_SMMU_S2CR_CBNDX(s2cr)==config_.cb_gmu))
-            return fail(A830SmmuStepSlots,A830ReasonSmmuRoute,A830_SMMU_GR0_S2CR(n),s2cr,A830_SMMU_S2CR_CBNDX(s2cr),kIOReturnBusy);
+            (A830_SMMU_S2CR_CBNDX(s2cr)==config_.cb_gpu || A830_SMMU_S2CR_CBNDX(s2cr)==config_.cb_gmu))ours=true;
+        if(ours) {
+            write32(A830_SMMU_GR0_S2CR(n),0);
+            write32(A830_SMMU_GR0_SMR(n),0);
+            s.warnings|=A830SmmuWarnSlotMoved;
+            used[n]=false;
+            s.smr[n]=0;s.s2cr[n]=0;
+            continue;
+        }
     }
     /* The board's preferred slots; a valid one moves to the lowest invalid slot, never 2 (TZ's secure stream). */
     const uint8_t preferred[3]={config_.slot_gpu,config_.slot_lpac,config_.slot_gmu};
@@ -354,7 +364,14 @@ IOReturn A830Smmu::programContext(unsigned cb,const ArmSmmu4KContextImage &image
 {
     Bank *b=bank(cb);
     /* ttbr1: 0, or the context's ASID with a 4 KiB-aligned guard table. */
-    if(!b || !actlr || (ttbr1&~kPhysMask&UINT64_C(0x0000ffffffffffff)) || ((ttbr1&kPhysMask) && ttbr1>>48!=image.ttbr0>>48))
+    /* piano: the ACTLR the board asks for is not what this hypervisor hands back (Gunyah owns the secure CX policy),
+     * so a zero readback is this board's normal state rather than a refusal. The context is programmed with what the
+     * SMMU actually reports. */
+    /* The guard table only exists for the design TCR; the annibale profile programs T0SZ 25 with TTBR1 = 0 (kernel
+     * sequences 7.4, section 14 #11), so its ASID comparison must not run there: on this board the caller still passes
+     * the encoded image's TTBR1 and the comparison refused the GPU context at step 7 with kIOReturnBadArgument. */
+    if(!b || (!annibale_ && ((ttbr1&~kPhysMask&UINT64_C(0x0000ffffffffffff)) ||
+                             ((ttbr1&kPhysMask) && ttbr1>>48!=image.ttbr0>>48))))
         return kIOReturnBadArgument;
     if(readback)*readback={};
     const uint16_t base=stepBase(cb,0xFFFF);

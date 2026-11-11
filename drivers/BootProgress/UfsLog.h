@@ -72,7 +72,9 @@ enum {
     UFS_LOG_FINAL_MS = 2000,
     UFS_LOG_FINAL_TICK_MS = 250,
     UFS_LOG_ADVANCE = 24 * 1024,            // or 7/8 of the smaller ring (pagani-ramoops-copy): a snapshot must still reach that far back
-    UFS_LOG_MAX_ERRORS = 3,
+    // Bring-up: publishing the root windows holds the UFS transport for seconds, so three failed
+    // rounds in a row happened during every boot and closed the log before user space started.
+    UFS_LOG_MAX_ERRORS = 600,
     UFS_LOG_CHECK_ROUNDS = 30,              // the GPT check and the statistics record
     UFS_LOG_EXPORT_STAGE = 64 * UFS_LOG_BLOCK,
     UFS_LOG_PANIC_BUDGET_US = 1000000,

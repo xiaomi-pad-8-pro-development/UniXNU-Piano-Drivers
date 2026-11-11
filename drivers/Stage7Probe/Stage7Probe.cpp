@@ -63,6 +63,7 @@ extern "C" __attribute__((weak)) void pagani_camera_start(void) {}
 // The sensors (drivers/PaganiSensors, appended to the Adreno830 archive) replace this default the same way. It reads its own boot argument
 // pagani-sensors (absent or 0: off, nothing registered) and returns at once; it opens PaganiAdsp IPC router ports, so it comes after
 // pagani_adsp_start, and its own kernel thread does the rest.
+extern "C" int piano_usb_bringup(void);   // defined in PianoUsb.cpp, included at the end of this file
 extern "C" __attribute__((weak)) void pagani_sensors_start(void) {}
 // The torch (drivers/PaganiTorch, appended to the Adreno830 archive) replaces this default the same way. It reads its own boot argument
 // pagani-torch (absent: off; 2: dry run) and returns at once; its own kernel thread does the rest.
@@ -142,7 +143,10 @@ static void startPeripherals(bool hidReady) {
         boot_progress_trace(panelAbsent);
         if (!started && boot_progress_trace_enabled() && (panelAbsentCall=thread_call_allocate(panelAbsentReport,nullptr))) panelAbsentRepeat(PANEL_ABSENT_FIRST_S);
     }
+    // The USB gadget (piano-usb=1) is started by NativeUfs: the same windows are known readable
+    // there, while by this point in the boot the core can already be gated.
 }
+
 // The GPU hand-off presenter (sheng-fb-gpu=1): attached to the resource service, not under the display subsystem's node (the original
 // display code enumerates that node's children: sheng int-075/077, SpringBoard found no display and crashed with the presenter there,
 // registered or not); its framebuffer memory comes from the display's nub. The Adreno driver reaches it through native_gop_handoff_*.
@@ -369,3 +373,7 @@ extern "C" void native_legacy_display_late_probe(void) {
     // On success the service and its real framebuffer provider live until reboot.
     OSSafeReleaseNULL(dtParent);
 }
+
+// The USB gadget lives in its own file but is compiled here: the arm driver recipe compiles exactly
+// one source file per component, so a second .cpp in the directory is never built.
+#include "PianoUsb.cpp"

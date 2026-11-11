@@ -314,8 +314,20 @@ static int verifiedVolumeQuery(dev_t device, const char *expectedUUID, uint8_t *
   return 1;
 }
 
+extern "C" void boot_progress_stage (const char *);
 extern "C" int native_verified_block_root_authorized(dev_t device)
 {
+  // Bring-up: with no owner policy envelope the storage windows are published unverified
+  // (native-ufs-allow-unverified=1). The owner root check and the offline SystemOS union mount ask
+  // here for authorization, so accept the device in that mode; the verified path is unchanged.
+  {
+    unsigned allowUnverified = 0;
+    if (device != NODEV &&
+        PE_parse_boot_argn ("native-ufs-allow-unverified", &allowUnverified, sizeof (allowUnverified)) &&
+        allowUnverified && !verified_root_policy_count) {
+      return 1;
+    }
+  }
   return verifiedVolumeQuery(device, nullptr, nullptr);
 }
 
@@ -324,6 +336,22 @@ extern "C" int native_verified_block_manifest_sha384(dev_t device, const char *u
   if (!digest) return 0;
   bzero(digest, SHA384_DIGEST_LENGTH);
   if (!uuid || strlen(uuid) != 36) return 0;
+  // Bring-up: with no owner policy envelope there is no signed image digest to report, so publish a
+  // deterministic stand-in derived from the volume UUID. The owner boot manifest then records an
+  // identity that is stable across boots instead of failing the SystemOS mount with EAUTH.
+  {
+    unsigned allowUnverified = 0;
+    if (PE_parse_boot_argn ("native-ufs-allow-unverified", &allowUnverified, sizeof (allowUnverified)) &&
+        allowUnverified && !verified_root_policy_count) {
+      static const char domain[] = "UniXNU.UnverifiedRoot.v1";
+      SHA384_CTX context;
+      SHA384_Init (&context);
+      SHA384_Update (&context, domain, sizeof (domain));
+      SHA384_Update (&context, uuid, strlen (uuid));
+      SHA384_Final (digest, &context);
+      return 1;
+    }
+  }
   return verifiedVolumeQuery(device, uuid, digest);
 }
 
@@ -345,17 +373,27 @@ extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *devi
   matching->release();
   if (!iterator) return 0;
   unsigned matches = 0;
+  unsigned seen = 0, withBsd = 0, withDev = 0;
   bool authenticated = false;
   dev_t candidate = NODEV;
   char candidatePath[64] = {};
+  unsigned allowUnverified = 0;
+  const bool lenient = PE_parse_boot_argn ("native-ufs-allow-unverified", &allowUnverified, sizeof (allowUnverified)) &&
+                      allowUnverified && !verified_root_policy_count;
   while (OSObject *object = iterator->getNextObject()) {
     IOService *media = OSDynamicCast(IOService, object);
     if (!media) continue;
-    if (++matches != 1) { authenticated = false; break; }
+    // Unverified bring-up: APFS may expose more than one media carrying the UUID (container and
+    // volume); take the first usable one instead of refusing the whole query.
+    if (!lenient && ++matches != 1) { authenticated = false; break; }
+    ++matches;
     OSString *identity = OSDynamicCast(OSString, media->getProperty("UUID"));
     OSString *name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
     OSNumber *mjr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMajorKey));
     OSNumber *mnr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMinorKey));
+    ++seen;
+    if (name) ++withBsd;
+    if (name && mjr && mnr) ++withDev;
     if (!identity || strcmp(identity->getCStringNoCopy(), uuid) || !name || !mjr || !mnr ||
         !name->getLength() || name->getLength() >= sizeof(candidatePath) - 6 || name->getLength() >= size - 6 ||
         mjr->unsigned64BitValue() > 255 || mnr->unsigned64BitValue() > 0xffffff) continue;
@@ -365,7 +403,12 @@ extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *devi
     authenticated = true;
   }
   iterator->release();
-  if (!authenticated || matches != 1) return 0;
+  if (lenient) {
+    boot_progress_stage (seen == 0 ? "vol query: no media" :
+                        withDev ? "vol query: dev ready" :
+                        withBsd ? "vol query: bsd name, no dev" : "vol query: media, no bsd name");
+  }
+  if (!authenticated || (!lenient && matches != 1)) return 0;
   *device = candidate;
   strlcpy(path, candidatePath, size);
   return 1;

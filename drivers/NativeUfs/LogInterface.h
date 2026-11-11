@@ -52,6 +52,16 @@ extern "C" int native_ufs_log_open (uint64_t *firstLba, uint64_t *blocks, const 
   return ok;
 }
 
+// Bring-up: the BootProgress writer can decide "closed" before the storage geometry exists (it
+// tries once at start-up). Clearing that state lets a later attempt, made after the root windows
+// are published, open the window instead of the whole boot staying without a storage log.
+extern "C" void native_ufs_log_reset (void)
+{
+  gLogClosed = false;
+  gLogRegionBlocks = 0;
+  gLogRegionFirst = 0;
+}
+
 extern "C" int native_ufs_log_write (uint64_t rel, uint32_t blocks, const void *src)
 {
   if (!gLogRegionBlocks || !src || !blocks || rel >= gLogRegionBlocks || blocks > gLogRegionBlocks - rel) return 0;

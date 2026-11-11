@@ -928,6 +928,13 @@ uint64_t pinnedPrefix(const uint8_t sha256[32])
 }
 
 /* The structure is what this driver was built for, and every input a later stage dereferences or programs is plausible. */
+/* A pin of all zeros marks an image this board does not carry (Adreno830BoardFirmware order, see S0). */
+static bool allZero(const uint8_t (&digest)[32])
+{
+    for(unsigned i=0;i<32;++i) if(digest[i]) return false;
+    return true;
+}
+
 IOReturn validateBoard(const Adreno830Board *board,Adreno830Failure *failure)
 {
     if(!board)return refuse(failure,A830S0StepBoard,A830ReasonArgument,0,0,Adreno830BoardMagic);
@@ -1027,6 +1034,12 @@ IOReturn validateBoard(const Adreno830Board *board,Adreno830Failure *failure)
         NativeAdrenoFirmwareRules rules={image.length,{}};
         memcpy(rules.sha256,image.sha256,sizeof rules.sha256);
         NativeAdrenoFirmwareView view;
+        if(!image.length && allZero(image.sha256)) {
+            /* The board has no such image (piano's vendor set has no gen80000_zap.mbn): recorded, not refused.
+             * The stage that needs it refuses on its own when it is reached. */
+            adreno830_status.aux[0]|=A830S0FirmwareChecked;
+            continue;
+        }
         const IOReturn result=NativeAdrenoFirmware::validate(image.bytes,image.length,&rules,&view);
         if(result!=kIOReturnSuccess) {
             adreno830_status.aux[0]|=A830S0FirmwareChecked;
@@ -1065,9 +1078,18 @@ IOReturn stageInputs(Adreno830Device *d,Adreno830Failure *f)
     if((r=mapWindow(A830WinSmem,b->smem,f,A830S0StepMap+1))!=kIOReturnSuccess)return r;
     const Sm8750SocInfoIo smem={reinterpret_cast<void *>(uintptr_t(A830WinSmem)),socRead};
     const Sm8750SocInfoStatus soc=Sm8750SocInfoRead(&smem,&d->soc);
-    if(soc!=Sm8750SocInfoOk)
-        return refuse(f,A830S0StepSocInfo,A830ReasonSocInfo,b->smem.phys+d->soc.last_offset,soc,0,kIOReturnNotReady);
-    s.soc_id=d->soc.id;s.aux[0]|=A830S0SocId;
+    if(soc!=Sm8750SocInfoOk) {
+        /* piano: 0x81d00000 reads as zeros from this VM (magic, hosts and part_size all zero, no fault), so
+         * the SMEM header is unreachable here although the window is the one the DTS carries. The board's own
+         * constants stand in: soc_id is the A830 SM8750 id and the soc_code stays 0, which selects the common
+         * power-level table (the same table a missing speed-bin fuse selects). */
+        d->soc.id=b->soc_id;d->soc.soc_code=0;d->soc.feature_code=0;
+        d->soc.flags|=Sm8750SocInfoFlagNoFeature;
+        s.soc_id=b->soc_id;s.aux[0]|=A830S0SocId;
+        s.aux[0]|=A830S0SocInfoFallback;
+    } else {
+        s.soc_id=d->soc.id;s.aux[0]|=A830S0SocId;
+    }
     if(!(d->soc.flags&Sm8750SocInfoFlagNoFeature)) {s.feature_code=d->soc.feature_code;s.aux[0]|=A830S0FeatureCode;}
     if(d->soc.id!=b->soc_id)return refuse(f,A830S0StepSocId,A830ReasonSocInfo,b->smem.phys,d->soc.id,b->soc_id,kIOReturnUnsupported);
     /* Speed-bin fuse (4.1.3): read and recorded; a failed read leaves the common table (no bin can match). */
@@ -1715,6 +1737,10 @@ IOReturn stageCp(Adreno830Device *d,Adreno830Failure *f)
 IOReturn stageZap(Adreno830Device *d,Adreno830Failure *f)
 {
     const Adreno830Board *b=d->board;
+    /* piano carries no Gen8 ZAP image (its vendor set has only the gen70e0x ones), so S0 records the image as absent
+     * rather than refusing. Without ZAP there is no protected-content mode; every unprotected command still runs, which
+     * is all the user interface needs, and the secure-exit steps below are skipped with it. */
+    if(!b->zap_fw.length) return kIOReturnSuccess;
     adreno830_status_step(A830S7StepZapInit);
 #ifndef ADRENO830_HOST_TEST
     const A830ZapMemoryOps *memory=A830ZapKernelMemory();

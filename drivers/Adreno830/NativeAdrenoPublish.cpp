@@ -25,6 +25,7 @@
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <kern/task.h>
+#include <sys/proc.h>   // proc_selfpid for the client's pid
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoPublish.h"
 #include "NativeAdrenoMeter.h"

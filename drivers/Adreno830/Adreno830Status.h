@@ -42,6 +42,7 @@ enum : uint8_t {A830QmpNotRun,A830QmpDone,A830QmpTimeout,A830QmpRefused};
 enum : uint64_t {
     A830S0SocId=1u<<0,A830S0FeatureCode=1u<<1,A830S0SpeedBin=1u<<2,
     A830S0FirmwareChecked=1u<<3,A830S0FirmwareOk=1u<<4,A830S0Arc=1u<<5,A830S0Bcm=1u<<6,
+    A830S0SocInfoFallback=1u<<7,   /* the SMEM read failed and the board constants stood in */
 };
 /* S1/S2 page ("PWR", "SCM", "TCS"):
  *   aux[0] Sm8750GpuPowerTrace step | block << 8 | offset << 32      aux[1] its value | GPU_CC_PLL0 MODE << 32

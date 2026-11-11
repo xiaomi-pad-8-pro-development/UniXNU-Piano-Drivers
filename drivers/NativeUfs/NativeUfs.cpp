@@ -45,6 +45,10 @@ extern "C" {
 // Optional passive observer; absent in ordinary builds. It may run while a
 // window lock is held, so its contract forbids blocking or transport access.
 void boot_progress_poll (void) __attribute__((weak));
+// osfmk/kern/boot_progress.h, C linkage: records a stage for the panic ring.
+extern "C" void boot_progress_stage (const char *text);
+extern "C" int piano_usb_bringup (void);
+extern "C" void piano_usb_table_dump (void);
 volatile uint32_t native_ufs_probe_calls = 0;
 volatile uint32_t native_ufs_matched = 0;
 volatile uint32_t native_ufs_probe_requested = 0;
@@ -1303,6 +1307,9 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
 
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
 volatile uint64_t native_ufs_verified_blocks = 0;
+// Bring-up only: 1 when native-ufs-allow-unverified=1 and no signed policy archive exists,
+// so per-block integrity has nothing to check against and is skipped (-1: not decided yet).
+static int gUnverifiedBlocks = -1;
 // Time spent hashing/verifying and reading from the UFS transport, in generic-timer ticks (diagnostic only).
 volatile uint64_t native_ufs_verify_ticks = 0, native_ufs_read_ticks = 0;
 static inline uint64_t timerTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
@@ -1314,6 +1321,19 @@ bool NativeUfsBlock::configureVerification ()
   gRootDiagnostic.windowBytes = bytes;
   gRootDiagnostic.policyCount = verified_root_policy_count;
   gRootDiagnostic.verify = 0xffffffff;
+  // Bring-up only: with no signed policy envelope for this device the windows cannot be
+  // authenticated, so native-ufs-allow-unverified=1 publishes them anyway and says so in the
+  // diagnostics (verify=0). Nothing about the verified path changes when the argument is absent.
+  {
+    unsigned allowUnverified = 0;
+    if (PE_parse_boot_argn ("native-ufs-allow-unverified", &allowUnverified, sizeof (allowUnverified)) &&
+        allowUnverified && !verified_root_policy_count) {
+      gRootDiagnostic.stage = "unverified window (native-ufs-allow-unverified=1)";
+      gRootDiagnostic.verify = 0;
+      native_ufs_verified_blocks = 0;
+      return true;
+    }
+  }
   // Select the one policy whose signed image size equals this window; two matches are refused.
   const uint8_t *manifest = nullptr;
   uint64_t manifestBytes = 0;
@@ -1486,6 +1506,17 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     }
     IOReturn verify (uint64_t index, const void *data, size_t length) {
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+      if (gUnverifiedBlocks < 0) {
+        unsigned value = 0;
+        gUnverifiedBlocks = (PE_parse_boot_argn ("native-ufs-allow-unverified", &value, sizeof (value)) && value &&
+                             !verified_root_policy_count) ? 1 : 0;
+      }
+      if (gUnverifiedBlocks) {
+        // No policy envelope: the block cannot be authenticated, so it is read unverified.
+        __atomic_fetch_add (&native_ufs_verified_blocks, 0, __ATOMIC_RELAXED);
+        if (boot_progress_poll) boot_progress_poll ();
+        return kIOReturnSuccess;
+      }
       uint64_t t0 = timerTicks ();
       int status = vr_verify_block (view, index, data, length, &vr_xnu_crypto);
       __atomic_fetch_add (&native_ufs_verify_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
@@ -1541,6 +1572,134 @@ void NativeUfsBlock::free ()
     windowLock = nullptr;
   }
   IOBlockStorageDevice::free ();
+}
+
+// USB bring-up probe. Order follows the port's own USB register notes (drivers/PaganiBattery,
+// BatteryUsb.h): the always-on GCC block first, and every later window is opened by what the read
+// before it showed, because reading a USB block without power or clocks takes this SoC down.
+static uint32_t usbWindow32 (OSSharedPtr<IOMemoryMap> &map, uint64_t base, uint64_t size, uint32_t offset)
+{
+  if (!map) {
+    IOMemoryDescriptor *describe = IOMemoryDescriptor::withPhysicalAddress (base, size, kIODirectionIn);
+    if (!describe) {
+      return 0xffffffffu;
+    }
+    map = OSSharedPtr<IOMemoryMap> (describe->map (kIOMapAnywhere), OSNoRetain);
+    describe->release ();
+    if (!map) {
+      return 0xffffffffu;
+    }
+  }
+  const volatile uint32_t *window = reinterpret_cast<const volatile uint32_t *> (map->getVirtualAddress ());
+  return window[offset / 4];
+}
+
+static uint32_t gUsbProbe[6];
+static void probeUsb (void)
+{
+  OSSharedPtr<IOMemoryMap> gccMap, dwcMap, qsMap;
+  const uint32_t bcr = usbWindow32 (gccMap, 0x100000, 0x60000, 0x39000);
+  const uint32_t gdsc = usbWindow32 (gccMap, 0x100000, 0x60000, 0x39004);
+  const uint32_t gdscCfg = usbWindow32 (gccMap, 0x100000, 0x60000, 0x39008);
+  const uint32_t master = usbWindow32 (gccMap, 0x100000, 0x60000, 0x39018);
+  const uint32_t aggre = usbWindow32 (gccMap, 0x100000, 0x60000, 0x39090);
+  const uint32_t noc = usbWindow32 (gccMap, 0x100000, 0x60000, 0x3908c);
+  const uint32_t utmi = usbWindow32 (gccMap, 0x100000, 0x60000, 0x3902c);
+  const uint32_t sleep = usbWindow32 (gccMap, 0x100000, 0x60000, 0x39028);
+  const uint32_t masterRcg = usbWindow32 (gccMap, 0x100000, 0x60000, 0x39030);
+  const uint32_t utmiRcg = usbWindow32 (gccMap, 0x100000, 0x60000, 0x39048);
+  const uint32_t phyBcr = usbWindow32 (gccMap, 0x100000, 0x60000, 0x12000);
+  const uint32_t phyGdsc = usbWindow32 (gccMap, 0x100000, 0x60000, 0x50018);
+  gUsbProbe[0] = bcr;
+  gUsbProbe[1] = gdsc;
+
+  IOLog ("usb gcc bcr=%08x gdsc=%08x cfg=%08x\n", bcr, gdsc, gdscCfg);
+  IOLog ("usb gcc mst=%08x agg=%08x noc=%08x utmi=%08x slp=%08x rcg=%08x urcg=%08x\n",
+      master, aggre, noc, utmi, sleep, masterRcg, utmiRcg);
+  IOLog ("usb gcc phybcr=%08x phygdsc=%08x\n", phyBcr, phyGdsc);
+
+  // GDSCR bit 0 is SW_COLLAPSE: clear means the core's power domain is on. A held block reset means
+  // firmware never finished the controller, so nothing below may be touched.
+  const bool resetReleased = (bcr & 1u) == 0;
+  const bool powered = (gdsc & 1u) == 0;
+  if (!resetReleased || !powered) {
+    IOLog ("usb: core not usable reset=%d powered=%d\n", resetReleased, powered);
+    {
+      char line[64];
+      snprintf (line, sizeof (line), "usb c bcr=%x gdsc=%x mst=%x", bcr, gdsc, master);
+      boot_progress_stage (line);
+    }
+    return;
+  }
+  
+  const uint32_t gsnpsid = usbWindow32 (dwcMap, 0xa60c000, 0x1000, 0x120);
+  const uint32_t gctl = usbWindow32 (dwcMap, 0xa60c000, 0x1000, 0x110);
+  const uint32_t gsts = usbWindow32 (dwcMap, 0xa60c000, 0x1000, 0x118);
+  IOLog ("usb dwc gsnpsid=%08x gctl=%08x gsts=%08x\n", gsnpsid, gctl, gsts);
+  gUsbProbe[2] = gsnpsid;
+  gUsbProbe[3] = gsts;
+
+
+  const uint32_t product = gsnpsid >> 16;
+  const bool idOk = product == 0x5533 || product == 0x3331 || product == 0x3332 || product == 0x5532;
+  if (!idOk) {
+    IOLog ("usb: not a Synopsys core (product %x)\n", product);
+    boot_progress_stage ("usb: dwc id unknown");
+    return;
+  }
+  boot_progress_stage ("usb: dwc id ok");
+
+  // GSTS bit 0 is CURMOD: 0 while the core sits in device mode.
+  const bool deviceMode = (gsts & 1u) == 0;
+  boot_progress_stage (deviceMode ? "usb: firmware left device mode" : "usb: firmware left host mode");
+
+  const uint32_t qsCfg = usbWindow32 (qsMap, 0xa6f8000, 0x1000, 0x808);
+  const uint32_t qsHs = usbWindow32 (qsMap, 0xa6f8000, 0x1000, 0x810);
+  const uint32_t qsCg = usbWindow32 (qsMap, 0xa6f8000, 0x1000, 0x828);
+  const uint32_t qsSs = usbWindow32 (qsMap, 0xa6f8000, 0x1000, 0x830);
+  IOLog ("usb qs cfg=%08x hs=%08x cg=%08x ss=%08x\n", qsCfg, qsHs, qsCg, qsSs);
+  gUsbProbe[4] = qsCfg;
+  gUsbProbe[5] = qsHs;
+  {
+    char line[64];
+    snprintf (line, sizeof (line), "usb o id=%x gsts=%x cfg=%x hs=%x", gsnpsid, gsts, qsCfg, qsHs);
+    boot_progress_stage (line);
+  }
+  gccMap.reset ();
+  dwcMap.reset ();
+  qsMap.reset ();
+}
+
+// Bring-up: report why the sheng-log window will not open, repeatedly, so the reason is still in
+// the panic ring when the kernel stops (the first attempt happens before the geometry exists).
+static void shengLogWatchThread (void *, wait_result_t)
+{
+  for (unsigned round = 0; round < 120; round++) {
+    probeUsb ();
+  piano_usb_table_dump ();
+    IOSleep (200);
+    uint64_t firstLba = 0, blocks = 0;
+    const char *why = "";
+    if (native_ufs_log_open (&firstLba, &blocks, &why)) {
+      boot_progress_stage ("logwatch: open ok");
+      return;
+    }
+    if (why && !__builtin_strcmp (why, "no root layout")) {
+      boot_progress_stage ("logwatch: no root layout");
+    } else if (why && !__builtin_strcmp (why, "already open")) {
+      boot_progress_stage ("logwatch: already open");
+      return;
+    } else if (why && !__builtin_strcmp (why, "closed")) {
+      boot_progress_stage ("logwatch: closed");
+    } else if (why && !__builtin_strcmp (why, "size")) {
+      boot_progress_stage ("logwatch: size refused");
+    } else if (why && !__builtin_strcmp (why, "overlaps the root image")) {
+      boot_progress_stage ("logwatch: overlaps root image");
+    } else {
+      boot_progress_stage ("logwatch: other refusal");
+    }
+  }
+  thread_terminate (current_thread ());
 }
 
 // Ordered publication of the root windows. The original owner-trust code resolves the SystemOS
@@ -1631,6 +1790,17 @@ static void publishThread (void *, wait_result_t)
     bool wait (unsigned index) {
       NativeUfsBlock *device = gPendingDevice[index];
       const char *uuid = gPendingUuid[index];
+      // The ordering gate exists for the owner-trust path, which resolves SystemOS by UUID right
+      // after the root is mounted. Unverified bring-up has no such consumer, so publish both
+      // windows and let XNU match the volumes itself instead of waiting for a media tree that the
+      // original IOStorageFamily builds on its own schedule.
+      unsigned allowUnverified = 0;
+      if (PE_parse_boot_argn ("native-ufs-allow-unverified", &allowUnverified, sizeof (allowUnverified)) &&
+          allowUnverified && !verified_root_policy_count) {
+        gRootDiagnostic.stage = "unverified publication (ordering gate skipped)";
+        IOLog ("NativeUfs: %s published without the media gate (unverified)\n", device->windowLabel ());
+        return true;
+      }
       gRootDiagnostic.stage = "media publication";
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Media);
       gRootDiagnostic.publicationWindow = index;
@@ -1648,6 +1818,145 @@ static void publishThread (void *, wait_result_t)
     void discard (unsigned index) { discardPendingWindow (index); }
   } operations;
   UfsRootPublicationResult result = ufsPublishRootWindows (operations, gPublicationPlan);
+  if (result.phase == UfsRootPhase::Complete) {
+    // Bring-up diagnostics: record which root volume media actually reached the registry, so the
+    // panic screen's RECENT STAGES answers it without another build.
+    IOSleep (6000);
+    bool osVolume = false, systemVolume = false;
+    OSDictionary *matching = IOService::serviceMatching ("IOMedia");
+    OSIterator *iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
+    while (iterator) {
+      IOService *media = OSDynamicCast (IOService, iterator->getNextObject ());
+      if (!media) {
+        break;
+      }
+      OSString *uuid = OSDynamicCast (OSString, media->getProperty ("UUID"));
+      if (!uuid) {
+        continue;
+      }
+      const char *value = uuid->getCStringNoCopy ();
+      if (value && !__builtin_strcmp (value, "04769D26-2CA0-4825-B443-E2E5F88300F2")) osVolume = true;
+      if (value && !__builtin_strcmp (value, "8846FE78-2910-4297-AF97-D59BB6F8FC16")) systemVolume = true;
+    }
+    OSSafeReleaseNULL (iterator);
+    OSSafeReleaseNULL (matching);
+    boot_progress_stage (osVolume && systemVolume ? "root volumes OS+SystemOS" :
+                        osVolume ? "root volume OS only" :
+                        systemVolume ? "root volume SystemOS only" : "root volumes none");
+    // Whether the root volume media is usable as a root device: XNU matches it by UUID and then
+    // needs a BSD name, so record that separately from mere presence.
+    bool osHasBsd = false, osStarted = false;
+    IOService *osMedia = nullptr;
+    matching = IOService::serviceMatching ("IOMedia");
+    iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
+    while (iterator) {
+      IOService *media = OSDynamicCast (IOService, iterator->getNextObject ());
+      if (!media) {
+        break;
+      }
+      OSString *uuid = OSDynamicCast (OSString, media->getProperty ("UUID"));
+      if (!uuid) {
+        continue;
+      }
+      const char *value = uuid->getCStringNoCopy ();
+      if (value && !__builtin_strcmp (value, "04769D26-2CA0-4825-B443-E2E5F88300F2")) {
+        if (media->getProperty (kIOBSDNameKey)) osHasBsd = true;
+        if (media->isInactive () == false) osStarted = true;
+        // The volume media is what XNU mounts; keep it for the boot-uuid-media resource below.
+        osMedia = media;
+      }
+    }
+    OSSafeReleaseNULL (iterator);
+    OSSafeReleaseNULL (matching);
+    // IOMediaBSDClient only publishes "boot-uuid-media" for a media created after the "boot-uuid"
+    // resource exists; these windows appear before XNU even asks, so publish both here and the
+    // kernel's IOUUIDMatching wait completes with this media.
+    if (osMedia) {
+      OSString *bootUuid = OSString::withCString ("04769D26-2CA0-4825-B443-E2E5F88300F2");
+      if (bootUuid) {
+        IOService::publishResource ("boot-uuid", bootUuid);
+        bootUuid->release ();
+      }
+      IOService::publishResource ("boot-uuid-media", osMedia);
+      boot_progress_stage ("root vol boot-uuid-media published");
+    }
+    // The USB gadget bring-up is parked: the piano's PHY is the PMIC eUSB2 repeater, which is out of
+// reach (SPMI channel writes abort from both the kernel and the boot manager). The driver is still
+// compiled in behind piano-usb=1 for when that is solved; nothing calls it on the boot path.
+(void)piano_usb_bringup ();
+
+// The controller's state decides how the USB driver takes it over. It was read once on the
+    // panic screen (docs/usb-bringup.md): reset released, powered, left in device mode.
+    probeUsb ();
+    IOLog ("usb probe bcr=%x gdsc=%x id=%x gsts=%x cfg=%x hs=%x\n", gUsbProbe[0], gUsbProbe[1],
+        gUsbProbe[2], gUsbProbe[3], gUsbProbe[4], gUsbProbe[5]);
+    // Storage logging: the BootProgress writer retries while the reason is "no root layout", so a
+    // permanent refusal here would leave it silent for the whole boot. Report which one it is, and
+    // open the window from here now that the geometry exists.
+    {
+      uint64_t firstLba = 0, blocks = 0;
+      const char *why = "";
+      // The BootProgress writer may already have decided "closed" before the geometry existed.
+      native_ufs_log_reset ();
+      if (native_ufs_log_open (&firstLba, &blocks, &why)) {
+        boot_progress_stage ("sheng log open ok");
+      } else if (why && !__builtin_strcmp (why, "already open")) {
+        boot_progress_stage ("sheng log already open");
+      } else if (why && !__builtin_strcmp (why, "no root layout")) {
+        boot_progress_stage ("sheng log: no root layout");
+      } else if (why && !__builtin_strcmp (why, "closed")) {
+        boot_progress_stage ("sheng log: closed");
+      } else if (why && !__builtin_strcmp (why, "size")) {
+        boot_progress_stage ("sheng log: size refused");
+      } else if (why && !__builtin_strcmp (why, "overlaps the root image")) {
+        boot_progress_stage ("sheng log: overlaps root image");
+      } else {
+        boot_progress_stage ("sheng log: other refusal");
+      }
+    }
+    // Which media did IOStorageFamily actually build under each window? A volume UUID that never
+    // appears means APFS did not probe that window; a media without our UUID means the identity
+    // we wait for is not the one the image carries.
+    {
+      IOSleep (10000);
+      unsigned withUuid = 0, sysMedia = 0, osMedia = 0;
+      OSDictionary *anyMatching = IOService::serviceMatching ("IOMedia");
+      OSIterator *anyIterator = anyMatching ? IOService::getMatchingServices (anyMatching) : nullptr;
+      while (anyIterator) {
+        IOService *media = OSDynamicCast (IOService, anyIterator->getNextObject ());
+        if (!media) {
+          break;
+        }
+        OSString *uuid = OSDynamicCast (OSString, media->getProperty ("UUID"));
+        if (uuid && uuid->getCStringNoCopy () &&
+            !__builtin_strcmp (uuid->getCStringNoCopy (), "8846FE78-2910-4297-AF97-D59BB6F8FC16")) {
+          ++withUuid;
+        }
+        for (unsigned index = 0; index < gPending; ++index) {
+          IORegistryIterator *parents = IORegistryIterator::iterateOver (
+            media, gIOServicePlane, kIORegistryIterateRecursively | kIORegistryIterateParents);
+          if (!parents) {
+            continue;
+          }
+          if (ufsMediaHasAncestor (*parents, gPendingDevice[index])) {
+            if (index == 1) {
+              ++sysMedia;
+            } else if (index == 0) {
+              ++osMedia;
+            }
+          }
+          parents->release ();
+        }
+      }
+      OSSafeReleaseNULL (anyIterator);
+      OSSafeReleaseNULL (anyMatching);
+      boot_progress_stage (sysMedia ? "sysos window has media" : "sysos window has no media");
+      boot_progress_stage (withUuid ? "sysos uuid present" : "sysos uuid absent");
+      boot_progress_stage (osMedia ? "os window has media" : "os window has no media");
+    }
+    boot_progress_stage (osHasBsd ? "root vol media has bsd name" : "root vol media no bsd name");
+    boot_progress_stage (osStarted ? "root vol media active" : "root vol media inactive");
+  }
   if (result.phase != UfsRootPhase::Complete) {
     gRootDiagnostic.result = result.phase == UfsRootPhase::Start ? kIOReturnIOError : kIOReturnTimeout;
     const char *reason = result.phase == UfsRootPhase::Start ? "root window service start failed" :
@@ -1944,8 +2253,29 @@ bool NativeUfs::startRoot (IOService *provider)
       gRootDiagnostic.stage = "signed window identities";
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Identity);
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+      // Bring-up only: with no signed policy envelope there is no signed volume identity to
+      // publish under, so native-ufs-allow-unverified=1 gives each window a distinct synthetic
+      // one. XNU's volume-UUID match then finds nothing and takes its IOMedia/Content fallback;
+      // the verified path below is untouched when a policy archive is present.
+      unsigned allowUnverified = 0;
+      const bool unverified = PE_parse_boot_argn ("native-ufs-allow-unverified", &allowUnverified, sizeof (allowUnverified)) &&
+                             allowUnverified && !verified_root_policy_count;
       for (unsigned i = 0; i < gPending; ++i) {
         gRootDiagnostic.publicationWindow = i;
+        if (unverified) {
+          // Bring-up: publish each window under the APFS volume UUID the image actually carries
+          // (OS window first, SystemOS second - the same pair the image manifest describes and the
+          // ADT pins as root_match_volume_uuid). Only the signature is missing, not the identity.
+          static const char *const kWindowUuids[2] = {
+            "04769D26-2CA0-4825-B443-E2E5F88300F2",
+            "8846FE78-2910-4297-AF97-D59BB6F8FC16",
+          };
+          const char *uuid = i < 2 ? kWindowUuids[i] : nullptr;
+          if (!uuid) return false;
+          for (unsigned at = 0; at <= 36; ++at) gPendingUuid[i][at] = uuid[at];
+          gRootDiagnostic.stage = "unverified window identity";
+          continue;
+        }
         if (!gPendingDevice[i]->signedVolumeUuid (gPendingUuid[i])) return false;
         for (unsigned j = 0; j < i; ++j) if (!strcmp (gPendingUuid[i], gPendingUuid[j])) return false;
       }

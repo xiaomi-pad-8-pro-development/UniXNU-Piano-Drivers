@@ -1675,8 +1675,6 @@ static void probeUsb (void)
 static void shengLogWatchThread (void *, wait_result_t)
 {
   for (unsigned round = 0; round < 120; round++) {
-    probeUsb ();
-  piano_usb_table_dump ();
     IOSleep (200);
     uint64_t firstLba = 0, blocks = 0;
     const char *why = "";
@@ -1821,7 +1819,6 @@ static void publishThread (void *, wait_result_t)
   if (result.phase == UfsRootPhase::Complete) {
     // Bring-up diagnostics: record which root volume media actually reached the registry, so the
     // panic screen's RECENT STAGES answers it without another build.
-    IOSleep (6000);
     bool osVolume = false, systemVolume = false;
     OSDictionary *matching = IOService::serviceMatching ("IOMedia");
     OSIterator *iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
@@ -1880,16 +1877,6 @@ static void publishThread (void *, wait_result_t)
       IOService::publishResource ("boot-uuid-media", osMedia);
       boot_progress_stage ("root vol boot-uuid-media published");
     }
-    // The USB gadget bring-up is parked: the piano's PHY is the PMIC eUSB2 repeater, which is out of
-// reach (SPMI channel writes abort from both the kernel and the boot manager). The driver is still
-// compiled in behind piano-usb=1 for when that is solved; nothing calls it on the boot path.
-(void)piano_usb_bringup ();
-
-// The controller's state decides how the USB driver takes it over. It was read once on the
-    // panic screen (docs/usb-bringup.md): reset released, powered, left in device mode.
-    probeUsb ();
-    IOLog ("usb probe bcr=%x gdsc=%x id=%x gsts=%x cfg=%x hs=%x\n", gUsbProbe[0], gUsbProbe[1],
-        gUsbProbe[2], gUsbProbe[3], gUsbProbe[4], gUsbProbe[5]);
     // Storage logging: the BootProgress writer retries while the reason is "no root layout", so a
     // permanent refusal here would leave it silent for the whole boot. Report which one it is, and
     // open the window from here now that the geometry exists.
@@ -1918,7 +1905,6 @@ static void publishThread (void *, wait_result_t)
     // appears means APFS did not probe that window; a media without our UUID means the identity
     // we wait for is not the one the image carries.
     {
-      IOSleep (10000);
       unsigned withUuid = 0, sysMedia = 0, osMedia = 0;
       OSDictionary *anyMatching = IOService::serviceMatching ("IOMedia");
       OSIterator *anyIterator = anyMatching ? IOService::getMatchingServices (anyMatching) : nullptr;

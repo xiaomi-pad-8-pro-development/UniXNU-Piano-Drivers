@@ -385,8 +385,7 @@ extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *devi
     if (!media) continue;
     // Unverified bring-up: APFS may expose more than one media carrying the UUID (container and
     // volume); take the first usable one instead of refusing the whole query.
-    if (!lenient && ++matches != 1) { authenticated = false; break; }
-    ++matches;
+    if (++matches != 1 && !lenient) { authenticated = false; break; }
     OSString *identity = OSDynamicCast(OSString, media->getProperty("UUID"));
     OSString *name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
     OSNumber *mjr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMajorKey));

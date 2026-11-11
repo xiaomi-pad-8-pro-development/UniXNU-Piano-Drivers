@@ -27,6 +27,8 @@
 #include <kern/task.h>
 #include <sys/proc.h>   // proc_selfpid for the client's pid
 #include "NativeAdrenoUserClient.h"
+// <sys/proc.h> keeps proc_selfpid() behind KERNEL_PRIVATE for this include set.
+extern "C" int proc_selfpid(void);
 #include "NativeAdrenoPublish.h"
 #include "NativeAdrenoMeter.h"
 #include "Adreno830Status.h"

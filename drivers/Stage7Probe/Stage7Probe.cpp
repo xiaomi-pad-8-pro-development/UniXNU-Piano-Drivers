@@ -112,6 +112,10 @@ static void panelAbsentReport(thread_call_param_t,thread_call_param_t) {
     boot_progress_trace(panelAbsent);
     panelAbsentRepeat(PANEL_ABSENT_S);
 }
+static thread_call_t touchLaterCall;
+static void touchLater(thread_call_param_t,thread_call_param_t) {
+    startPeripheral(pagani_input_allocate(true),"touch started (delayed)",PAGANI_TOUCH);
+}
 static void startPeripherals(bool hidReady) {
     boot_progress_peripheral_enable(enabled("pagani-peripheral-status"));
     boot_progress_platform_enable(enabled("pagani-platform-status"));
@@ -126,7 +130,13 @@ static void startPeripherals(bool hidReady) {
         }
         if (enabled("pagani-touch")) {
             boot_progress_peripheral(PAGANI_TOUCH,stage,ready?0:kIOReturnNotReady,0,0);
-            if (ready) startPeripheral(pagani_input_allocate(true),"S3910 touch started",PAGANI_TOUCH);
+            // pagani-touch-delay=<s>: start touch that long after the display instead of here, for bring-up on a board whose
+            // touch setup can still hang the bus (the boot and a USB console are up by then).
+            unsigned delay=0;PE_parse_boot_argn("pagani-touch-delay",&delay,sizeof delay);
+            if (ready && delay && (touchLaterCall=thread_call_allocate(touchLater,nullptr))) {
+                uint64_t deadline=0;clock_interval_to_deadline(delay,NSEC_PER_SEC,&deadline);
+                thread_call_enter_delayed(touchLaterCall,deadline);
+            } else if (ready) startPeripheral(pagani_input_allocate(true),"S3910 touch started",PAGANI_TOUCH);
         }
     }
     // pagani-panel is a bit mask since the brightness work: bit 0 runs the panel service, the others are PaganiPanel's own (PanelBrightness.h).

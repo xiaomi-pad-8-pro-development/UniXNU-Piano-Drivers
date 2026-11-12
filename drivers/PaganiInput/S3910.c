@@ -268,3 +268,8 @@ void s3910_hid_report(const struct s3910_frame *frame,const struct s3910_frame *
     }
     report[61]=(uint8_t)count;
 }
+
+/* The NT36532 THP protocol and tracker (Nvt/, UniXNU ShengNovatekTouch, Apache-2.0) build in this object: boards with
+ * PAGANI_TOUCH_NVT (Xiaomi piano) use them in place of TouchComm; on others they stay unreferenced. */
+#include "Nvt/NvtProtocol.c"
+#include "Nvt/NvtTouchCore.c"

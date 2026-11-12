@@ -14,6 +14,13 @@
 extern "C" {
 #include "S3910.h"
 #include <GeniSpi.h>
+#include "Nvt/NvtProtocol.h"
+#include "Nvt/NvtTouchCore.h"
+#ifdef PAGANI_TOUCH_NVT
+#include "Nvt/NvtFirmware_boe.inc"
+#include "Nvt/NvtFirmware_csot.inc"
+#endif
+void boot_progress_stage(const char *);
 }
 
 #include "Reports.h"
@@ -80,9 +87,84 @@ class PaganiInput : public IOHIDDevice {
     char touchPhase[24]={};
     uint32_t screenWidth=0,screenHeight=0;
     pagani_script script={};
+#ifdef PAGANI_TOUCH_NVT
+    // NT36532 THP (Xiaomi piano): the protocol of Nvt/ over the same SE DMA transport. Buffers: Nvt/NvtProtocol.h sizes.
+    nvt_bus nvtBus={};
+    nvt_chip nvt={};
+    uint8_t *nvtScratch=nullptr,*nvtRx=nullptr;
+    nvt_fw *nvtFw=nullptr;
+    nvt_fw_info nvtInfo={};
+    nvt_touch_core *nvtCore=nullptr;
+    uint8_t *nvtFrame=nullptr;
+    int16_t *nvtMatrix=nullptr;
+    unsigned nvtCounter=~0u,nvtFrames=0,nvtTypes=0;
+    // One THP scan: the 32-byte header window first, the full frame only when its counter moved. The piano firmware marks touch
+    // scans type 3 (UEFI TouchProbe); the tracker takes them as its data frames (type 4). Contacts go out in the TouchComm frame
+    // (0..32767 per axis), so the HID path stays the one the S3910 boards use.
+    // After a firmware download the controller is still starting: a read before it raises the frame-ready line once can
+    // make it reset. Until the line has changed level once, only that line (a TLMM read, not the bus) is sampled.
+    int nvtAttnSeen=-1;
+    int pollNvt(s3910_frame &frame) {
+        if (nvtAttnSeen<1) {
+            int level=(int)(PeripheralWindow::read(&pins[5],4)&1);
+            if (nvtAttnSeen<0) {nvtAttnSeen=level?2:3;return 0;}   // 2/3: first level high/low
+            if (level==(nvtAttnSeen==2)) return 0;
+            nvtAttnSeen=1;
+        }
+        uint8_t hdr[NVT_THP_PEEK_LEN];
+        int rc=nvt_peek_frame_header(&nvt,hdr);if (rc) return rc;
+        if (!nvt_peek_valid(hdr)) return 0;
+        unsigned counter=nvt_peek_counter(hdr);
+        if (counter==nvtCounter) return 0;
+        rc=nvt_read_frame(&nvt,nvtFrame);if (rc) return rc;
+        if (!nvt_frame_header_valid(nvtFrame)) return 0;
+        nvtCounter=nvt_frame_counter(nvtFrame);++nvtFrames;
+        unsigned type=nvt_frame_type(nvtFrame);
+        if (type<32) nvtTypes|=1u<<type;
+        if (type==3) type=4;
+        nvt_frame_matrix(nvtFrame,nvtMatrix);
+        nvt_contact contacts[S3910_CONTACTS];
+        int n=nvt_touch_process(nvtCore,nvtMatrix,type,contacts,S3910_CONTACTS);
+        if (n<0) return 0;
+        // No finger now and none in the last report: nothing to tell iPadOS (an empty report per scan kept the screen waking).
+        bool was=false;for (auto &c:previous.contact) was|=c.active!=0;
+        if (!n && !was) return 0;
+        frame={};
+        for (int i=0;i<n;++i) {
+            unsigned slot=(unsigned)contacts[i].slot%S3910_CONTACTS;
+            frame.contact[slot].x=(uint16_t)((uint32_t)contacts[i].x*32767u/NVT_LONG_AXIS_MAX);
+            // The sensor's short axis runs bottom to top on the piano (slide test 2026-11-12), the screen's top to bottom.
+            frame.contact[slot].y=(uint16_t)(32767u-(uint32_t)contacts[i].y*32767u/NVT_SHORT_AXIS_MAX);
+            frame.contact[slot].active=1;
+        }
+        return 1;
+    }
+    PeripheralWindow lcdId;
+    static constexpr size_t kNvtScratch=NVT_TRANSFER_LEN+8,kNvtRx=NVT_READ_MAX+2;
+    static int nvtXfer(void *ctx,const uint8_t *tx,uint8_t *rx,size_t len) {
+        return static_cast<PaganiInput *>(ctx)->transferTouch(tx,rx,len);
+    }
+    static void nvtDelay(void *,unsigned ms) {IOSleep(ms);}
+#endif
     void observe(const char *stage,int result=0) {
+#ifdef PAGANI_TOUCH_NVT
+        // Bring-up: every touch step on the boot screen as it starts, so a bus hang leaves its step as the last line.
+        if (touch && stage!=phase && !__atomic_load_n(&running,__ATOMIC_RELAXED)) {
+            char line[48];snprintf(line,sizeof line,"touch: %s",stage);boot_progress_stage(line);
+            // And to the kernel log, with time for the USB console to send it before the step runs.
+            IOLog("%s (sample %x)\n",line,sample);
+        }
+#endif
         phase=stage;
+        if (touch && !result && !drawDue()) return;
         boot_progress_peripheral(touch?PAGANI_TOUCH:PAGANI_KEYS,phase,result,sample,reports);
+    }
+    // While touch runs, the status rows redraw at most five times a second: a redraw per scan (120 Hz) took the screen to 16 fps.
+    uint64_t lastDrawMs=0,lastXYLogMs=0;
+    bool drawDue() {
+        if (!__atomic_load_n(&running,__ATOMIC_RELAXED)) return true;
+        uint64_t ms=nowMs();if (ms-lastDrawMs<200) return false;
+        lastDrawMs=ms;return true;
     }
     void observeTouch(int result) {
         snprintf(touchPhase,sizeof touchPhase,"T%u %02x %s",controller.version,controller.command,controller.stage);
@@ -90,7 +172,11 @@ class PaganiInput : public IOHIDDevice {
     }
     int transferTouch(const uint8_t *tx,uint8_t *rx,size_t size) {
         spi.snap_valid=0;
+#ifdef PAGANI_TOUCH_NVT
+        bool capture=false;   // no RESET pin on this board: pins[4] is never mapped
+#else
         bool capture=rx && !firstReadCaptured;
+#endif
         uint32_t pin=capture?(PeripheralWindow::read(&pins[5],4)&1):0;
         if (spi.use_dma) dmaExposed=true;
         int rc=geni_spi_transfer(&spi,tx,rx,size,0);
@@ -124,7 +210,12 @@ class PaganiInput : public IOHIDDevice {
     }
     static void sleepTouch(void *,unsigned ms) {IOSleep(ms);}
     int setupDma() {
+#ifdef PAGANI_TOUCH_NVT
+        constexpr size_t bytes=65536;   // one NT36532 firmware block (NVT_TRANSFER_LEN + 8) per direction
+        static_assert(NVT_TRANSFER_LEN+8<=bytes && NVT_THP_FRAME_LEN+2<=bytes,"NT36532 transfer fits DMA buffer");
+#else
         constexpr size_t bytes=4096;
+#endif
         static_assert(S3910_PAYLOAD_MAX+7<=bytes,"touch transfer fits DMA page");
         observe("DMA allocate");
         dmaMemory=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
@@ -244,6 +335,93 @@ class PaganiInput : public IOHIDDevice {
         pagani_drv2_release();
         IOSleep(PAGANI_TOUCH_POWER_MS);return 0;
     }
+#ifdef PAGANI_TOUCH_NVT
+    // QUP1 SE2 has no DFS clock source on SM8750 (gcc_qupv3_wrap1_s2_clk_src is a fixed divider of the QSPI reference):
+    // vote the wrapper and SE branches, wait for them, and keep the source the boot firmware left running.
+    int nvtClock() {
+        auto g=gcc.io();
+        sm8750_gcc_vote_report report={};
+        int rc=sm8750_gcc_vote_set(&g,PAGANI_TOUCH_GCC_VOTE,SM8750_GCC_OWNER_TOUCH,&report);sample=report.after;
+        if (rc) return rc;
+        const uint32_t branches[]=PAGANI_TOUCH_GCC_BRANCHES;
+        for (uint32_t branch:branches) {
+            unsigned n=0;
+            for (;n<200;++n) {
+                uint32_t v=peripheral_read(&g,branch);
+                if ((v&2) || !(v&0x80000000u)) break;
+                IODelay(1);
+            }
+            if (n==200) {sample=branch;return -110;}
+        }
+        return 0;
+    }
+    int setupTouch() {
+        observe("GCC map");
+        if (!gcc.map(PAGANI_GCC_BASE,0x60000)) return -12;
+        observe("SPI clock");int rc=nvtClock();if (rc) return rc;
+        observe("SPI map");
+        if (!se.map(PAGANI_TOUCH_SE,0x4000) || !wrapper.map(PAGANI_TOUCH_WRAPPER,0x1000)) return -12;
+        spi.se={&se,PeripheralWindow::read,PeripheralWindow::write,PeripheralWindow::delay};
+        spi.wrapper={&wrapper,PeripheralWindow::read,PeripheralWindow::write,PeripheralWindow::delay};
+        observe("GENI firmware");rc=geni_spi_read_info(&spi);if (rc) return rc;
+        sample=spi.info.geni_status;
+        if (spi.info.protocol!=GENI_PROTO_SPI) return GENI_ERR_PROTO;
+        if (spi.info.geni_status&(GENI_STATUS_M_ACTIVE|(1u<<12))) return -16;
+        spi.poll_only=1;spi.poll_limit=200000;
+        if (spi.info.fifo_disabled) {rc=setupDma();if (rc) return rc;spi.poll_only=2;}
+        observe("SPI init");rc=geni_spi_init(&spi);if (rc) return rc;
+        observe("SPI mode");rc=geni_spi_setup(&spi,0,0);if (rc) return rc;
+        // The divider the UEFI touch driver runs this engine with (pianoPkg TouchProbe: 4 and 1 lose the controller).
+        observe("SPI rate");
+        rc=geni_spi_set_clock(&spi,PAGANI_TOUCH_HZ,PAGANI_TOUCH_HZ*PAGANI_TOUCH_CLK_DIV*spi.oversampling,0);if (rc) return rc;
+        const unsigned gpios[]=PAGANI_TOUCH_PINS;
+        const unsigned drives[]=PAGANI_TOUCH_DRIVES;
+        for (unsigned i=0;i<4;++i) {
+            sample=gpios[i];observe("touch GPIO");
+            if (!pins[i].map(PAGANI_TLMM_GPIO(gpios[i]),0x1000)) return -12;
+            savedPins[i]=PeripheralWindow::read(&pins[i],0);
+            PeripheralWindow::write(&pins[i],0,(savedPins[i]&~0x3ffu)|(drives[i]<<6)|(PAGANI_TOUCH_SPI_FUNC<<2));
+            ++pinsConfigured;
+        }
+        // ATTN (frame ready) is only read; its Android pinctrl state is gpio input, which is the reset state.
+        if (!pins[5].map(PAGANI_TLMM_GPIO(PAGANI_TOUCH_ATTN),0x1000)) return -12;
+        nvtScratch=static_cast<uint8_t *>(IOMalloc(kNvtScratch));nvtRx=static_cast<uint8_t *>(IOMalloc(kNvtRx));
+        if (!nvtScratch || !nvtRx) return -12;
+        nvtBus={this,nvtXfer,nvtDelay};
+        nvt.bus=&nvtBus;nvt.scratch=nvtScratch;nvt.rxbuf=nvtRx;
+        observe("NVT identify");rc=nvt_identify(&nvt);
+        sample=(uint32_t)nvt.id[2]|(uint32_t)nvt.id[3]<<8|(uint32_t)nvt.id[4]<<16|(uint32_t)nvt.id[5]<<24;
+        IOLog("Pagani touch NT36532 id %02x %02x %02x %02x %02x %02x cascade %d rc %d\n",nvt.id[0],nvt.id[1],nvt.id[2],
+            nvt.id[3],nvt.id[4],nvt.id[5],nvt.cascade,rc);
+        if (rc) return rc;
+        // Panel vendor from the LCD id pin, as the Android driver reads it: 0 CSOT, 1 BOE. Each panel has its own firmware.
+        observe("NVT panel");
+        if (!lcdId.map(PAGANI_TLMM_GPIO(PAGANI_TOUCH_LCD_ID),0x1000)) return -12;
+        const bool boe=(PeripheralWindow::read(&lcdId,4)&1)!=0;
+        lcdId.release();
+        nvtFw=static_cast<nvt_fw *>(IOMalloc(sizeof(nvt_fw)));if (!nvtFw) return -12;
+        rc=boe?nvt_fw_parse(nvtFw,nvt_fw_boe,nvt_fw_boe_len):nvt_fw_parse(nvtFw,nvt_fw_csot,nvt_fw_csot_len);
+        IOLog("Pagani touch firmware %s: %u partitions rc %d\n",boe?"BOE":"CSOT",nvtFw->count,rc);
+        if (rc) return rc;
+        observe("NVT download");rc=nvt_download_firmware(&nvt,nvtFw);
+        IOLog("Pagani touch download rc %d attempt %u stage %u stage-rc %d\n",rc,nvt.dl_attempt,nvt.dl_stage,nvt.dl_rc);
+        sample=(nvt.dl_attempt<<8)|nvt.dl_stage;
+        if (rc) return rc;
+        observe("NVT start");rc=nvt_start_scanning(&nvt,&nvtInfo);
+        IOLog("Pagani touch fw ver %u type %u grid %ux%u max %ux%u rc %d\n",nvtInfo.fw_ver,nvtInfo.fw_type,nvtInfo.x_num,
+            nvtInfo.y_num,nvtInfo.abs_x_max,nvtInfo.abs_y_max,rc);
+        sample=nvtInfo.fw_ver;
+        // The piano THP firmware does not take the host commands (it never clears them; the UEFI driver sends none), so a timeout
+        // there is not fatal: frames run without them.
+        if (rc==NVT_ERR_BUS) return rc;
+        nvtCore=static_cast<nvt_touch_core *>(IOMalloc(sizeof(nvt_touch_core)));
+        nvtFrame=static_cast<uint8_t *>(IOMalloc(NVT_THP_FRAME_LEN));
+        nvtMatrix=static_cast<int16_t *>(IOMalloc(NVT_NODES*sizeof(int16_t)));
+        if (!nvtCore || !nvtFrame || !nvtMatrix) return -12;
+        nvt_touch_reset(nvtCore);
+        controller.ready=1;phase="NVT frames";return 0;
+    }
+#else
     int setupTouch() {
         observe("GCC map");
         if (!gcc.map(PAGANI_GCC_BASE,0x60000)) return -12;
@@ -292,6 +470,7 @@ class PaganiInput : public IOHIDDevice {
         observeTouch(rc);
         return rc;
     }
+#endif
     IOReturn bindTouchEvents() {
         if (touchEvents) return touchEvents->isInactive()?kIOReturnNotReady:kIOReturnSuccess;
         IOService *driver=pagani_hid::findDriver(this,4);
@@ -307,6 +486,7 @@ class PaganiInput : public IOHIDDevice {
         touchBinding|=16;touchEvents=driver;return kIOReturnSuccess;
     }
     void showTouchEvents() {
+        if (!drawDue()) return;
         boot_progress_touch_hid(touchBinding,touchUsage,__atomic_load_n(&pagani_hid::events,__ATOMIC_RELAXED),
             __atomic_load_n(&pagani_hid::digitizers,__ATOMIC_RELAXED),__atomic_load_n(&pagani_hid::edges,__ATOMIC_RELAXED),
             lastInputXY,__atomic_load_n(&pagani_hid::lastXY,__ATOMIC_RELAXED),__atomic_load_n(&pagani_hid::lastMask,__ATOMIC_RELAXED));
@@ -380,13 +560,26 @@ class PaganiInput : public IOHIDDevice {
         auto self=static_cast<PaganiInput *>(owner);
         if (!__atomic_load_n(&self->running,__ATOMIC_ACQUIRE)) return;
         if (self->touch) {
+#ifdef PAGANI_TOUCH_NVT
+            if (self->controller.ready) {
+                s3910_frame frame={};int rc=self->pollNvt(frame);
+                self->sample=(self->nvtFrames&0xffff)|(self->nvtTypes<<16);
+#else
             if (self->controller.ready) self->sample=PeripheralWindow::read(&self->pins[5],4)&1;
             if (self->controller.ready && !self->sample) {
                 s3910_frame frame={};int rc=s3910_poll(&self->controller,&frame);
+#endif
                 if (rc==1) {
                     __atomic_fetch_add(&pagani_input_touch_events,1u,__ATOMIC_RELAXED);
                     self->sample=0;for (unsigned i=0;i<S3910_CONTACTS;++i) if (frame.contact[i].active) self->sample|=1u<<i;
                     for (auto &c:frame.contact) if (c.active) {self->lastInputXY=(uint32_t)c.x<<16|c.y;break;}
+#ifdef PAGANI_TOUCH_NVT
+                    // Bring-up: where the first finger is, twice a second, to check the axes against the screen.
+                    if (self->sample && nowMs()-self->lastXYLogMs>=500) {
+                        self->lastXYLogMs=nowMs();
+                        IOLog("touch xy %u %u fingers %x reports %u\n",self->lastInputXY>>16,self->lastInputXY&0xffff,self->sample,(unsigned)self->reports);
+                    }
+#endif
                     if (!self->script.armed || self->scriptFrame()) {
                         uint8_t report[62];s3910_hid_report(&frame,&self->previous,report);
                         if (self->send(report,sizeof report)) self->previous=frame;
@@ -395,7 +588,11 @@ class PaganiInput : public IOHIDDevice {
                 } else if (rc<0) {
                     self->controller.ready=0;self->touchError=rc;self->setProperty("InputError",(uint32_t)rc,32);
                 } else {
+#ifdef PAGANI_TOUCH_NVT
+                    self->observe("NVT idle");
+#else
                     self->sample=self->controller.code;self->observe("TouchComm idle");
+#endif
                 }
             }
             else if (self->controller.ready && !self->reports) self->observe("ATTN wait");
@@ -418,6 +615,16 @@ class PaganiInput : public IOHIDDevice {
             PeripheralWindow::write(&pins[i],0,savedPins[i]);
         }
         pinsConfigured=0;for (auto &pin:pins) pin.release();
+#ifdef PAGANI_TOUCH_NVT
+        if (nvtScratch) IOFree(nvtScratch,kNvtScratch);
+        if (nvtRx) IOFree(nvtRx,kNvtRx);
+        if (nvtFw) IOFree(nvtFw,sizeof(nvt_fw));
+        if (nvtCore) IOFree(nvtCore,sizeof(nvt_touch_core));
+        if (nvtFrame) IOFree(nvtFrame,NVT_THP_FRAME_LEN);
+        if (nvtMatrix) IOFree(nvtMatrix,NVT_NODES*sizeof(int16_t));
+        nvtFw=nullptr;nvtCore=nullptr;nvtFrame=nullptr;nvtMatrix=nullptr;
+        nvtScratch=nvtRx=nullptr;
+#endif
         releasePlusKey();
         if (se.base && spi.use_dma) PeripheralWindow::write(&se,SE_IRQ_EN,0);
         // shortcut: retain the exposed 8 KiB until reboot; DMA reset completion is not yet qualified on this board.

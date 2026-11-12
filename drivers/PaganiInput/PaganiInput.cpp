@@ -182,12 +182,16 @@ class PaganiInput : public IOHIDDevice {
     // cleanup. Without it the ring/silent switch stays at ring and the other keys still start.
     void setupPlusKey() {
         observe("Plus key");
+#ifndef PAGANI_PLUS_KEY_GPIO
+        return;   // the board has no Plus key
+#else
         if (!plusKey.map(PAGANI_TLMM_GPIO(PAGANI_PLUS_KEY_GPIO),0x1000)) return;
         plusSaved=PeripheralWindow::read(&plusKey,0);
         uint32_t config=pagani_plus_key_config(plusSaved);
         PeripheralWindow::write(&plusKey,0,config);plusConfigured=true;
         sample=PeripheralWindow::read(&plusKey,0);
         if ((sample&0x3ff)!=(config&0x3ff)) releasePlusKey();
+#endif
     }
     void releasePlusKey() {
         if (plusConfigured) PeripheralWindow::write(&plusKey,0,plusSaved);

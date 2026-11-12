@@ -20,6 +20,11 @@ enum {
 };
 // Raw pressed mask: PON bits 7/6 are Power/Volume Up; the PMIC GPIO and the Plus key's TLMM input are active low.
 static inline uint8_t pagani_buttons(uint8_t pon,uint8_t gpio,uint32_t plus) {
+#ifdef PAGANI_PON_RESIN_VOLUME_DOWN
+    // Boards that wire RESIN to Volume Down and Volume Up to the PMIC GPIO (Xiaomi piano).
+    return (uint8_t)(((pon&PAGANI_PON_POWER)?PAGANI_KEY_POWER:0)|((pon&PAGANI_PON_VOLUME_UP)?PAGANI_KEY_VOLUME_DOWN:0)|
+                     ((gpio&PAGANI_GPIO_VOLUME_DOWN)?0:PAGANI_KEY_VOLUME_UP)|((plus&1)?0:PAGANI_KEY_PLUS));
+#endif
     return (uint8_t)(((pon&PAGANI_PON_POWER)?PAGANI_KEY_POWER:0)|((pon&PAGANI_PON_VOLUME_UP)?PAGANI_KEY_VOLUME_UP:0)|
                      ((gpio&PAGANI_GPIO_VOLUME_DOWN)?0:PAGANI_KEY_VOLUME_DOWN)|((plus&1)?0:PAGANI_KEY_PLUS));
 }

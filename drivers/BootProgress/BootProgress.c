@@ -10,6 +10,7 @@
 #include "CrashTrace.h"
 #if !defined(BOOT_PROGRESS_TEST) || defined(BOOT_PROGRESS_STALL_TEST)
 #include "StallProbe.h"
+extern int PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
 #endif
 #ifdef BOOT_PROGRESS_TEST
 // The host test (Test/console.c) supplies the frame-rate clock and the boot-args.
@@ -1301,8 +1302,20 @@ void boot_progress_poll(void) {}
 void boot_progress_user_breakpoint(void *state, unsigned esr) { (void)state; (void)esr; }
 void boot_progress_user_abort(void *state, unsigned esr, uint64_t far) { (void)state; (void)esr; (void)far; }
 void boot_progress_critical_exit(int pid, char *s, unsigned long n) { (void)pid; (void)s; (void)n; }
+// pagani-exec-log=1: every exec step and exit to the log and status line. Off by default: a line per process start costs the
+// console and the screen a redraw each, and a normal boot runs hundreds of them. Failed exits are always kept.
+static int exec_log(void)
+{
+    static int value = -1;
+    if (value < 0) {
+        uint32_t arg = 0;
+        value = PE_parse_boot_argn("pagani-exec-log", &arg, sizeof(arg)) && arg;
+    }
+    return value;
+}
 void boot_progress_process_stage(int pid, const char *name, const char *stage)
 {
+    if (!exec_log()) return;
     char line[STAGE_BYTES];
     snprintf(line, sizeof(line), "pid=%d %.20s %.36s", pid, name ? name : "?", stage ? stage : "?");
     // The on-medium snapshots read the kernel message buffer; a process record kept only in the RAM
@@ -1319,6 +1332,7 @@ void boot_progress_exit(int pid, const char *name, int status, unsigned ns, uint
     if (flags == UINT64_MAX) return;
     if (!panic_state && !busy) copy_line(exit_stage, sizeof(exit_stage), line);
     irq_restore(flags);
+    if (!exec_log() && !status) return;
     printf("bp: %s\n", line);
     boot_progress_stage(line);
 }
